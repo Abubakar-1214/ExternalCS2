@@ -72,7 +72,7 @@ public class Player : EntityBase
         ViewOffset = gameProcess.Read<Vector3>(AddressBase + Offsets.m_vecViewOffset);
         EyePosition = Origin + ViewOffset;
         ViewAngles = gameProcess.ModuleClient.Read<Vector3>(Offsets.dwViewAngles);
-        AimPunchAngle = gameProcess.Read<Vector3>(AddressBase + Offsets.m_AimPunchAngle);
+        AimPunchAngle = ReadAimPunchAngle(gameProcess);
         FFlags = gameProcess.Read<int>(AddressBase + Offsets.m_fFlags);
 
         EyeDirection =
@@ -106,5 +106,30 @@ public class Player : EntityBase
             nameof(WeaponIndexes.Smokegrenade), nameof(WeaponIndexes.Flashbang), nameof(WeaponIndexes.Hegrenade),
             nameof(WeaponIndexes.Molotov)
         }.Contains(CurrentWeaponName);
+    }
+
+    /// <summary>
+    /// Reads the current aim punch. CS2 no longer stores it directly on the pawn:
+    /// the value lives inside the pawn's aim-punch services object
+    /// (C_CSPlayerPawn -&gt; m_pAimPunchServices -&gt; CCSPlayer_AimPunchServices).
+    /// The applied punch is the predictable base angle plus the unpredictable
+    /// (randomised) base angle.
+    /// </summary>
+    private Vector3 ReadAimPunchAngle(GameProcess gameProcess)
+    {
+        try
+        {
+            var punchServices = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_pAimPunchServices);
+            if (punchServices == IntPtr.Zero) return Vector3.Zero;
+
+            var predictable = gameProcess.Read<Vector3>(punchServices + Offsets.m_predictableBaseAngle);
+            var unpredictable = gameProcess.Read<Vector3>(punchServices + Offsets.m_unpredictableBaseAngle);
+
+            return predictable + unpredictable;
+        }
+        catch
+        {
+            return Vector3.Zero;
+        }
     }
 }

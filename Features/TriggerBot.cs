@@ -71,8 +71,8 @@ public sealed class TriggerBot : ThreadedServiceBase
         if (localPlayerPawn == IntPtr.Zero)
             return IntPtr.Zero;
 
-        var entityId = _gameProcess.Read<int>(localPlayerPawn + Offsets.m_iIDEntIndex);
-        if (entityId < 0)
+        var entityId = _gameProcess.Read<int>(localPlayerPawn + Offsets.m_iIDEntIndex) & 0x7FFF;
+        if (entityId <= 0)
             return IntPtr.Zero;
 
         var entityList = _gameProcess.ModuleClient.Read<IntPtr>(Offsets.dwEntityList);
@@ -112,8 +112,16 @@ public sealed class TriggerBot : ThreadedServiceBase
         if (_gameProcess.Process == null)
             return false;
 
-        // Читаем позицию головы (или origin, если костей нет)
-        var origin = _gameProcess.Read<Vector3>(entityPtr + Offsets.m_vecOrigin);
+        // Читаем позицию головы (или origin, если костей нет).
+        // Origin lives on the game scene node, not on the pawn itself.
+        var sceneNode = _gameProcess.Read<IntPtr>(entityPtr + Offsets.m_pGameSceneNode);
+        if (sceneNode == IntPtr.Zero)
+            return false;
+
+        var origin = _gameProcess.Read<Vector3>(sceneNode + Offsets.m_vecOrigin);
+        if (origin.LengthSquared() < 0.01f)
+            origin = _gameProcess.Read<Vector3>(sceneNode + Offsets.m_vecAbsOrigin);
+
         var eyePos = _gameData.Player.EyePosition;
         var toTarget = origin - eyePos;
         var distance = toTarget.Length();

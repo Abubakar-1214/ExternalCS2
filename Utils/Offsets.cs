@@ -15,7 +15,11 @@ public abstract class Offsets
     public static int dwLocalPlayerPawn;
     public static int m_vOldOrigin;
     public static int m_vecViewOffset;
-    public static int m_AimPunchAngle;
+    // CS2 moved the aim punch out of the pawn into a dedicated service object.
+    // The chain is: C_CSPlayerPawn + m_pAimPunchServices -> CCSPlayer_AimPunchServices.
+    public static int m_pAimPunchServices;
+    public static int m_predictableBaseAngle;
+    public static int m_unpredictableBaseAngle;
     public static int m_modelState;
     public static int m_pGameSceneNode;
     public static int m_fFlags;
@@ -37,7 +41,16 @@ public abstract class Offsets
     public static int dwViewAngles;
     public static int m_entitySpottedState;
     public static int m_Item;
-    public static int m_pClippingWeapon;
+    // The active weapon is no longer a direct pointer on the pawn; it is reached
+    // through the weapon-services object:
+    //   C_BasePlayerPawn + m_pWeaponServices -> CPlayer_WeaponServices
+    //   CPlayer_WeaponServices + m_hActiveWeapon -> entity handle (index = handle & 0x7FFF)
+    public static int m_pWeaponServices;
+    public static int m_hActiveWeapon;
+    // Helmet / defuser live on the item-services object.
+    public static int m_pItemServices;
+    // Spectator target lives on the observer-services object.
+    public static int m_pObserverServices;
     public static int m_pActionTrackingServices;
     public static int m_AttributeManager;
     public static int m_iItemDefinitionIndex;
@@ -81,6 +94,7 @@ public abstract class Offsets
     }
 
     public static int m_vecOrigin;
+    public static int m_vecAbsOrigin;
 
     public static readonly Dictionary<string, int> Bones = new()
     {
@@ -174,7 +188,10 @@ public abstract class Offsets
             {
                 foreach (var field in fieldsElem.EnumerateObject())
                 {
-                    fields[field.Name] = field.Value.GetInt32();
+                    // Upstream schema evolved: a field is either a bare number
+                    // (legacy layout) or an object { "offset": N, "type": "..." }.
+                    var offset = ReadFieldOffset(field.Value);
+                    if (offset.HasValue) fields[field.Name] = offset.Value;
                 }
             }
             classes[className] = fields;
@@ -201,7 +218,9 @@ public abstract class Offsets
         destData.m_fFlags = GetField(classes, "C_BaseEntity", "m_fFlags");
         destData.m_vOldOrigin = GetField(classes, "C_BasePlayerPawn", "m_vOldOrigin");
         destData.m_vecViewOffset = GetField(classes, "C_BaseModelEntity", "m_vecViewOffset");
-        destData.m_aimPunchAngle = GetField(classes, "C_CSPlayerPawn", "m_aimPunchAngle");
+        destData.m_pAimPunchServices = GetField(classes, "C_CSPlayerPawn", "m_pAimPunchServices");
+        destData.m_predictableBaseAngle = GetField(classes, "CCSPlayer_AimPunchServices", "m_predictableBaseAngle");
+        destData.m_unpredictableBaseAngle = GetField(classes, "CCSPlayer_AimPunchServices", "m_unpredictableBaseAngle");
         destData.m_modelState = GetField(classes, "CSkeletonInstance", "m_modelState");
         destData.m_pGameSceneNode = GetField(classes, "C_BaseEntity", "m_pGameSceneNode");
         destData.m_iIDEntIndex = GetField(classes, "C_CSPlayerPawn", "m_iIDEntIndex");
@@ -214,7 +233,10 @@ public abstract class Offsets
         destData.m_hObserverTarget = GetField(classes, "CPlayer_ObserverServices", "m_hObserverTarget");
         destData.m_entitySpottedState = GetField(classes, "C_CSPlayerPawn", "m_entitySpottedState");
         destData.m_Item = GetField(classes, "C_AttributeContainer", "m_Item");
-        destData.m_pClippingWeapon = GetField(classes, "C_CSPlayerPawn", "m_pClippingWeapon");
+        destData.m_pWeaponServices = GetField(classes, "C_BasePlayerPawn", "m_pWeaponServices");
+        destData.m_hActiveWeapon = GetField(classes, "CPlayer_WeaponServices", "m_hActiveWeapon");
+        destData.m_pItemServices = GetField(classes, "C_BasePlayerPawn", "m_pItemServices");
+        destData.m_pObserverServices = GetField(classes, "C_BasePlayerPawn", "m_pObserverServices");
         destData.m_AttributeManager = GetField(classes, "C_EconEntity", "m_AttributeManager");
         destData.m_iItemDefinitionIndex = GetField(classes, "C_EconItemView", "m_iItemDefinitionIndex");
         destData.m_bIsScoped = GetField(classes, "C_CSPlayerPawn", "m_bIsScoped");
@@ -227,6 +249,8 @@ public abstract class Offsets
         destData.m_flC4Blow = GetField(classes, "C_PlantedC4", "m_flC4Blow");
         destData.m_bBeingDefused = GetField(classes, "C_PlantedC4", "m_bBeingDefused");
         destData.m_bGameRestart = GetField(classes, "C_CSGameRules", "m_bGameRestart");
+        destData.m_bInReload = GetField(classes, "C_CSWeaponBase", "m_bInReload");
+        destData.m_vecAbsOrigin = GetField(classes, "CGameSceneNode", "m_vecAbsOrigin");
 
         destData.m_ArmorValue = GetField(classes, "C_CSPlayerPawn", "m_ArmorValue");
         destData.m_bHasHelmet = GetField(classes, "CCSPlayer_ItemServices", "m_bHasHelmet");
@@ -251,13 +275,49 @@ public abstract class Offsets
         throw new InvalidOperationException($"Field '{name}' not found in JSON or is not a number.");
     }
 
-    private static int GetField(Dictionary<string, Dictionary<string, int>> classes, string className, string fieldName)
+    /// <summary>
+    /// Reads a class-field offset from either the legacy layout (bare number)
+    /// or the current layout ({ "offset": N, "type": "..." }). Returns null when
+    /// the entry carries no usable offset.
+    /// </summary>
+    private static int? ReadFieldOffset(JsonElement fieldValue)
     {
-        if (!classes.TryGetValue(className, out var fields))
-            throw new InvalidOperationException($"Class '{className}' not found in client_dll.json");
-        if (!fields.TryGetValue(fieldName, out var offset))
-            throw new InvalidOperationException($"Field '{className}.fields.{fieldName}' not found in client_dll.json");
-        return offset;
+        switch (fieldValue.ValueKind)
+        {
+            case JsonValueKind.Number:
+                return fieldValue.GetInt32();
+
+            case JsonValueKind.Object:
+                if (fieldValue.TryGetProperty("offset", out var offsetProp) &&
+                    offsetProp.ValueKind == JsonValueKind.Number)
+                {
+                    return offsetProp.GetInt32();
+                }
+                return null;
+
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>
+    /// Resolves a class field offset, falling back to an alternate class when the
+    /// primary one no longer carries the field (upstream moves fields between
+    /// classes as the game schema evolves).
+    /// </summary>
+    private static int GetField(Dictionary<string, Dictionary<string, int>> classes, string className, string fieldName,
+        params (string Class, string Field)[] fallbacks)
+    {
+        if (classes.TryGetValue(className, out var fields) && fields.TryGetValue(fieldName, out var offset))
+            return offset;
+
+        foreach (var (fbClass, fbField) in fallbacks)
+        {
+            if (classes.TryGetValue(fbClass, out var fbFields) && fbFields.TryGetValue(fbField, out var fbOffset))
+                return fbOffset;
+        }
+
+        throw new InvalidOperationException($"Field '{className}.fields.{fieldName}' not found in client_dll.json");
     }
 
     private static async Task<string> FetchJson(string url)
@@ -276,7 +336,9 @@ public abstract class Offsets
         dwLocalPlayerPawn = data.dwLocalPlayerPawn;
         m_vOldOrigin = data.m_vOldOrigin;
         m_vecViewOffset = data.m_vecViewOffset;
-        m_AimPunchAngle = data.m_aimPunchAngle;
+        m_pAimPunchServices = data.m_pAimPunchServices;
+        m_predictableBaseAngle = data.m_predictableBaseAngle;
+        m_unpredictableBaseAngle = data.m_unpredictableBaseAngle;
         m_modelState = data.m_modelState;
         m_pGameSceneNode = data.m_pGameSceneNode;
         m_iIDEntIndex = data.m_iIDEntIndex;
@@ -308,7 +370,10 @@ public abstract class Offsets
         dwEntityList = data.dwEntityList;
         m_entitySpottedState = data.m_entitySpottedState;
         m_Item = data.m_Item;
-        m_pClippingWeapon = data.m_pClippingWeapon;
+        m_pWeaponServices = data.m_pWeaponServices;
+        m_hActiveWeapon = data.m_hActiveWeapon;
+        m_pItemServices = data.m_pItemServices;
+        m_pObserverServices = data.m_pObserverServices;
         m_AttributeManager = data.m_AttributeManager;
         m_iItemDefinitionIndex = data.m_iItemDefinitionIndex;
         m_bIsScoped = data.m_bIsScoped;
@@ -329,7 +394,9 @@ public abstract class Offsets
         m_angEyeAngles = data.m_angEyeAngles;
         m_CBodyComponent = data.m_CBodyComponent;
         m_bGameRestart = data.m_bGameRestart;
+        m_bInReload = data.m_bInReload;
         m_vecOrigin = data.m_vecOrigin;
+        m_vecAbsOrigin = data.m_vecAbsOrigin;
     }
 
     #endregion

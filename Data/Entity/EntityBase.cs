@@ -44,7 +44,7 @@ public abstract class EntityBase
     private IntPtr CurrentWeapon { get; set; }
     public string CurrentWeaponName { get; private set; } = null!;
 
-    private short WeaponIndex { get; set; }
+    private int WeaponIndex { get; set; }
     public Vector3 Velocity { get; private set; }
 
     public virtual bool IsAlive()
@@ -74,13 +74,25 @@ public abstract class EntityBase
         LifeState = gameProcess.Read<bool>(AddressBase + Offsets.m_lifeState);
         Health = gameProcess.Read<int>(AddressBase + Offsets.m_iHealth);
         Team = gameProcess.Read<int>(AddressBase + Offsets.m_iTeamNum).ToTeam();
-        Origin = gameProcess.Read<Vector3>(AddressBase + Offsets.m_vOldOrigin);
+
+        // The world position lives on the game scene node, not on the pawn.
+        var sceneNode = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_pGameSceneNode);
+        Origin = ReadOrigin(gameProcess, sceneNode);
+
         ShotsFired = gameProcess.Read<int>(AddressBase + Offsets.m_iShotsFired);
 
         // === Читаем недостающие поля ===
         Armor = gameProcess.Read<int>(AddressBase + Offsets.m_ArmorValue);
-        HasHelmet = gameProcess.Read<bool>(AddressBase + Offsets.m_bHasHelmet);
-        IsVisible = gameProcess.Read<bool>(AddressBase + Offsets.m_bSpotted);
+
+        // Helmet / defuser live on the item-services object.
+        var itemServices = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_pItemServices);
+        HasHelmet = itemServices != IntPtr.Zero &&
+                    gameProcess.Read<bool>(itemServices + Offsets.m_bHasHelmet);
+
+        // "Spotted" is a bit inside the embedded EntitySpottedState_t structure.
+        IsVisible = gameProcess.Read<bool>(
+            AddressBase + Offsets.m_entitySpottedState + Offsets.m_bSpotted);
+
         Flags = (EntityFlags)gameProcess.Read<int>(AddressBase + Offsets.m_fFlags);
         IsDefusing = gameProcess.Read<bool>(AddressBase + Offsets.m_bBeingDefused);
 
@@ -98,29 +110,106 @@ public abstract class EntityBase
         // Оружие
         try
         {
-            CurrentWeapon = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_pClippingWeapon);
-            var weaponIndexAddress = CurrentWeapon + Offsets.m_AttributeManager + Offsets.m_Item + Offsets.m_iItemDefinitionIndex;
-            WeaponIndex = gameProcess.Read<short>(weaponIndexAddress);
+            CurrentWeapon = ResolveActiveWeapon(gameProcess);
+            if (CurrentWeapon != IntPtr.Zero)
+            {
+                // C_EconEntity embeds C_AttributeContainer, which in turn embeds
+                // C_EconItemView, so the item definition index is a flat sum of offsets.
+                var weaponIndexAddress = CurrentWeapon + Offsets.m_AttributeManager +
+                                        Offsets.m_Item + Offsets.m_iItemDefinitionIndex;
+                var rawIndex = gameProcess.Read<ushort>(weaponIndexAddress);
+                WeaponIndex = rawIndex;
 
-            var name = Enum.GetName(typeof(WeaponIndexes), WeaponIndex);
-            CurrentWeaponName = string.IsNullOrEmpty(name) ? $"weapon_{WeaponIndex}" : name;
+                IsReloading = gameProcess.Read<bool>(CurrentWeapon + Offsets.m_bInReload);
+
+                var name = Enum.GetName(typeof(WeaponIndexes), WeaponIndex);
+                CurrentWeaponName = string.IsNullOrEmpty(name) ? $"weapon_{WeaponIndex}" : name;
+            }
+            else
+            {
+                WeaponIndex = -1;
+                IsReloading = false;
+                CurrentWeaponName = string.Empty;
+            }
         }
         catch
         {
             CurrentWeapon = IntPtr.Zero;
             WeaponIndex = -1;
+            IsReloading = false;
             CurrentWeaponName = string.Empty;
         }
 
         Velocity = gameProcess.Read<Vector3>(AddressBase + Offsets.m_vecAbsVelocity);
 
-        if (gameProcess.Process != null)
+        // Spectator target: handle -> entity address through the observer services.
+        try
         {
-            ObserverTarget = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_hObserverTarget);
+            var observerServices = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_pObserverServices);
+            if (observerServices != IntPtr.Zero)
+            {
+                var observerHandle = gameProcess.Read<int>(observerServices + Offsets.m_hObserverTarget);
+                ObserverTarget = ResolveEntityHandle(gameProcess, observerHandle);
+            }
+            else
+            {
+                ObserverTarget = IntPtr.Zero;
+            }
+        }
+        catch
+        {
+            ObserverTarget = IntPtr.Zero;
         }
 
 
         return true;
+    }
+
+    /// <summary>
+    /// Reads the world position from the game scene node. CS2 keeps the origin
+    /// on CGameSceneNode; the pawn itself only carries a stale "old origin".
+    /// </summary>
+    private static Vector3 ReadOrigin(GameProcess gameProcess, IntPtr sceneNode)
+    {
+        if (sceneNode == IntPtr.Zero) return Vector3.Zero;
+
+        var origin = gameProcess.Read<Vector3>(sceneNode + Offsets.m_vecOrigin);
+        if (origin.LengthSquared() > 0.01f) return origin;
+
+        // Fall back to the absolute origin when the quantized origin is empty.
+        var absOrigin = gameProcess.Read<Vector3>(sceneNode + Offsets.m_vecAbsOrigin);
+        return absOrigin;
+    }
+
+    /// <summary>
+    /// Resolves the pawn's active weapon: pawn -> weapon services -> active
+    /// weapon handle -> entity-list entry.
+    /// </summary>
+    private IntPtr ResolveActiveWeapon(GameProcess gameProcess)
+    {
+        var weaponServices = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_pWeaponServices);
+        if (weaponServices == IntPtr.Zero) return IntPtr.Zero;
+
+        var handle = gameProcess.Read<int>(weaponServices + Offsets.m_hActiveWeapon);
+        return ResolveEntityHandle(gameProcess, handle);
+    }
+
+    /// <summary>
+    /// Converts an entity handle (handle &amp; 0x7FFF = entity index) into the
+    /// absolute address of that entity inside the client entity list.
+    /// </summary>
+    protected IntPtr ResolveEntityHandle(GameProcess gameProcess, int handle)
+    {
+        if (handle == 0 || handle == -1) return IntPtr.Zero;
+        if (EntityList == IntPtr.Zero) return IntPtr.Zero;
+
+        var index = handle & 0x7FFF;
+        if (index <= 0) return IntPtr.Zero;
+
+        var listEntry = gameProcess.Read<IntPtr>(EntityList + 8 * (index >> 9) + 16);
+        if (listEntry == IntPtr.Zero) return IntPtr.Zero;
+
+        return gameProcess.Read<IntPtr>(listEntry + 112 * (index & 0x1FF));
     }
 
 

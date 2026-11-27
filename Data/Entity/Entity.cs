@@ -64,8 +64,11 @@ public class Entity : EntityBase
     {
         if (!base.Update(gameProcess)) return false;
 
-        _dormant = gameProcess.Process != null && gameProcess.Read<bool>(AddressBase + Offsets.m_bDormant);
-        IsSpotted = gameProcess.Process != null && gameProcess.Read<bool>(AddressBase + Offsets.m_entitySpottedState + 0x8);
+        // Dormancy is a flag on the game scene node, not on the pawn.
+        var sceneNode = gameProcess.Read<IntPtr>(AddressBase + Offsets.m_pGameSceneNode);
+        _dormant = sceneNode != IntPtr.Zero && gameProcess.Read<bool>(sceneNode + Offsets.m_bDormant);
+
+        IsSpotted = gameProcess.Process != null && gameProcess.Read<bool>(AddressBase + Offsets.m_entitySpottedState + Offsets.m_bSpotted);
         IsInScope = gameProcess.Process != null ? gameProcess.Read<int>(AddressBase + Offsets.m_bIsScoped) : 0;
         FlashAlpha = gameProcess.Process != null ? gameProcess.Read<int>(AddressBase + Offsets.m_flFlashDuration) : 0;
         Name = gameProcess.Process != null
